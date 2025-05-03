@@ -1,3 +1,5 @@
+[![MseeP.ai Security Assessment Badge](https://mseep.net/pr/bigcodegen-mcp-neovim-server-badge.png)](https://mseep.ai/app/bigcodegen-mcp-neovim-server)
+
 # Neovim MCP Server
 
 A proof of concept integration between Claude Desktop (or any client) and Neovim using Model Context Protocol (MCP) and the official neovim/node-client JavaScript library. This server leverages Vim's native text editing commands and workflows, which Claude already understands, to create a lightweight code or general purpose AI text assistance layer.

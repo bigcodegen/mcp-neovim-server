@@ -294,7 +294,7 @@ export class NeovimManager {
         pluginInfo
       };
 
-      if (mode.mode.startsWith('v')) {
+      if (mode.mode.startsWith('v') || mode.mode.startsWith('V')) {
         try {
           // Use a more reliable method to get the visual selection
           // This Lua code gets the actual selected text

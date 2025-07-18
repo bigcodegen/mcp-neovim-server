@@ -1,6 +1,6 @@
 {
   "name": "mcp-neovim-server",
-  "version": "0.5.3",
+  "version": "0.5.4",
   "description": "An MCP server for neovim",
   "type": "module",
   "bin": {

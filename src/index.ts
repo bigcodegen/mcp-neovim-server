@@ -12,7 +12,7 @@ import { z } from "zod";
 const server = new McpServer(
   {
     name: "mcp-neovim-server",
-    version: "0.5.3"
+    version: "0.5.4"
   }
 );
 

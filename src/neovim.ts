@@ -34,6 +34,14 @@ interface NeovimStatus {
   cwd: string;
   lspInfo?: string;
   pluginInfo?: string;
+  visualInfo?: {
+    hasActiveSelection: boolean;
+    visualModeType?: string;
+    startPos?: [number, number];
+    endPos?: [number, number];
+    lastVisualStart?: [number, number];
+    lastVisualEnd?: [number, number];
+  };
 }
 
 interface BufferInfo {
@@ -200,6 +208,123 @@ export class NeovimManager {
     }
   }
 
+  private async getVisualSelectionInfo(nvim: Neovim, mode: string): Promise<{
+    hasSelection: boolean;
+    selectedText?: string;
+    startPos?: [number, number];
+    endPos?: [number, number];
+    visualModeType?: string;
+    lastVisualStart?: [number, number];
+    lastVisualEnd?: [number, number];
+  }> {
+    try {
+      const isInVisualMode = mode.includes('v') || mode.includes('V') || mode.includes('\x16');
+
+      if (isInVisualMode) {
+        // Currently in visual mode - get active selection
+        const [startPos, endPos, initialVisualModeType] = await Promise.all([
+          nvim.call('getpos', ['v']) as Promise<[number, number, number, number]>,
+          nvim.call('getpos', ['.']) as Promise<[number, number, number, number]>,
+          nvim.call('visualmode', []) as Promise<string>
+        ]);
+
+        // Convert positions to [line, col] format
+        const start: [number, number] = [startPos[1], startPos[2]];
+        const end: [number, number] = [endPos[1], endPos[2]];
+
+        // Get the selected text using a more reliable approach
+        let selectedText = '';
+        let visualModeType = initialVisualModeType;
+        try {
+          const result = await nvim.lua(`
+            -- Get visual mode type first
+            local mode = vim.fn.visualmode()
+            if not mode or mode == '' then
+              return { text = '', mode = '' }
+            end
+
+            local start_pos = vim.fn.getpos('v')
+            local end_pos = vim.fn.getpos('.')
+            local start_line, start_col = start_pos[2], start_pos[3]
+            local end_line, end_col = end_pos[2], end_pos[3]
+
+            -- Ensure proper ordering (start should be before end)
+            if start_line > end_line or (start_line == end_line and start_col > end_col) then
+              start_line, end_line = end_line, start_line
+              start_col, end_col = end_col, start_col
+            end
+
+            local text = ''
+
+            if mode == 'v' then
+              -- Character-wise visual mode
+              if start_line == end_line then
+                local line = vim.api.nvim_buf_get_lines(0, start_line - 1, start_line, false)[1] or ''
+                text = line:sub(start_col, end_col)
+              else
+                local lines = vim.api.nvim_buf_get_lines(0, start_line - 1, end_line, false)
+                if #lines > 0 then
+                  -- Handle first line
+                  lines[1] = lines[1]:sub(start_col)
+                  -- Handle last line
+                  if #lines > 1 then
+                    lines[#lines] = lines[#lines]:sub(1, end_col)
+                  end
+                  text = table.concat(lines, '\\n')
+                end
+              end
+            elseif mode == 'V' then
+              -- Line-wise visual mode
+              local lines = vim.api.nvim_buf_get_lines(0, start_line - 1, end_line, false)
+              text = table.concat(lines, '\\n')
+            elseif mode == '\\022' then
+              -- Block-wise visual mode (Ctrl-V)
+              local lines = vim.api.nvim_buf_get_lines(0, start_line - 1, end_line, false)
+              local result = {}
+              for _, line in ipairs(lines) do
+                table.insert(result, line:sub(start_col, end_col))
+              end
+              text = table.concat(result, '\\n')
+            end
+
+            return { text = text, mode = mode }
+          `) as { text: string; mode: string };
+
+          selectedText = result.text || '';
+          visualModeType = result.mode || visualModeType;
+        } catch (e) {
+          selectedText = '[Selection text unavailable]';
+        }
+
+        return {
+          hasSelection: true,
+          selectedText,
+          startPos: start,
+          endPos: end,
+          visualModeType
+        };
+      } else {
+        // Not in visual mode - get last visual selection marks
+        try {
+          const [lastStart, lastEnd] = await Promise.all([
+            nvim.call('getpos', ["'<"]) as Promise<[number, number, number, number]>,
+            nvim.call('getpos', ["'>"]) as Promise<[number, number, number, number]>
+          ]);
+
+          return {
+            hasSelection: false,
+            lastVisualStart: [lastStart[1], lastStart[2]],
+            lastVisualEnd: [lastEnd[1], lastEnd[2]]
+          };
+        } catch (e) {
+          return { hasSelection: false };
+        }
+      }
+    } catch (error) {
+      return { hasSelection: false, selectedText: `Error: ${error instanceof Error ? error.message : 'Unknown error'}` };
+    }
+  }
+
   public async getNeovimStatus(): Promise<NeovimStatus | string> {
     try {
       const nvim = await this.connect();
@@ -280,10 +405,13 @@ export class NeovimManager {
         pluginInfo = 'Plugin information unavailable';
       }
 
+      // Get visual selection information using the new method
+      const visualInfo = await this.getVisualSelectionInfo(nvim, mode.mode);
+
       const neovimStatus: NeovimStatus = {
         cursorPosition: cursor,
         mode: mode.mode,
-        visualSelection: '',
+        visualSelection: visualInfo.selectedText || '',
         fileName: await buffer.name,
         windowLayout: JSON.stringify(layout),
         currentTab,
@@ -291,77 +419,16 @@ export class NeovimManager {
         registers,
         cwd,
         lspInfo,
-        pluginInfo
-      };
-
-      if (mode.mode.startsWith('v') || mode.mode.startsWith('V')) {
-        try {
-          // Use a more reliable method to get the visual selection
-          // This Lua code gets the actual selected text
-          const visualText = await nvim.lua(`
-            local mode = vim.fn.visualmode()
-            if mode == '' then
-              return ''
-            end
-            
-            -- Save current register content
-            local save_reg = vim.fn.getreg('"')
-            local save_regtype = vim.fn.getregtype('"')
-            
-            -- Yank the visual selection to unnamed register
-            vim.cmd('normal! "vy')
-            
-            -- Get the yanked text
-            local selected_text = vim.fn.getreg('"')
-            
-            -- Restore the register
-            vim.fn.setreg('"', save_reg, save_regtype)
-            
-            return selected_text
-          `);
-          
-          neovimStatus.visualSelection = String(visualText || '');
-        } catch (e) {
-          // Fallback method using getpos and getline
-          try {
-            const start = await nvim.eval(`getpos("'<")`) as [number, number, number, number];
-            const end = await nvim.eval(`getpos("'>")`) as [number, number, number, number];
-            
-            if (start[1] === end[1]) {
-              // Single line selection
-              const line = await nvim.eval(`getline(${start[1]})`) as string;
-              const startCol = start[2] - 1; // Convert to 0-based
-              const endCol = end[2]; // Keep 1-based for substring end
-              neovimStatus.visualSelection = line.substring(startCol, endCol);
-            } else {
-              // Multi-line selection
-              const lines = await nvim.eval(`getline(${start[1]}, ${end[1]})`) as string[];
-              if (lines && lines.length > 0) {
-                const result = [];
-                const startCol = start[2] - 1;
-                const endCol = end[2];
-                
-                // First line: from start column to end
-                result.push(lines[0].substring(startCol));
-                
-                // Middle lines: complete lines
-                for (let i = 1; i < lines.length - 1; i++) {
-                  result.push(lines[i]);
-                }
-                
-                // Last line: from beginning to end column
-                if (lines.length > 1) {
-                  result.push(lines[lines.length - 1].substring(0, endCol));
-                }
-                
-                neovimStatus.visualSelection = result.join('\n');
-              }
-            }
-          } catch (e2) {
-            neovimStatus.visualSelection = '';
-          }
+        pluginInfo,
+        visualInfo: {
+          hasActiveSelection: visualInfo.hasSelection,
+          visualModeType: visualInfo.visualModeType,
+          startPos: visualInfo.startPos,
+          endPos: visualInfo.endPos,
+          lastVisualStart: visualInfo.lastVisualStart,
+          lastVisualEnd: visualInfo.lastVisualEnd
         }
-      }
+      };
 
       return neovimStatus;
     } catch (error) {

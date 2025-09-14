@@ -2,8 +2,6 @@
 
 Connect Claude Desktop (or any Model Context Protocol client) to Neovim using MCP and the official neovim/node-client JavaScript library. This server leverages Vim's native text editing commands and workflows, which Claude already understands, to create a lightweight code or general purpose AI text assistance layer.
 
-**Version 0.5.3** - Now with a DXT package!
-
 <a href="https://glama.ai/mcp/servers/s0fywdwp87"><img width="380" height="200" src="https://glama.ai/mcp/servers/s0fywdwp87/badge" alt="mcp-neovim-server MCP server" /></a>
 
 ## Features
@@ -40,7 +38,8 @@ Connect Claude Desktop (or any Model Context Protocol client) to Neovim using MC
   - On error, `'nvim:errmsg'` contents are returned 
 - **vim_status**
   - Get comprehensive Neovim status
-  - Returns cursor position, mode, filename, visual selection, window layout, current tab, marks, registers, working directory, LSP client info, and plugin detection
+  - Returns cursor position, mode, filename, visual selection with enhanced detection, window layout, current tab, marks, registers, working directory, LSP client info, and plugin detection
+  - Enhanced visual selection reporting: detects visual mode type (character/line/block), provides accurate selection text, start/end positions, and last visual selection marks
 - **vim_edit**
   - Edit lines using insert, replace, or replaceAll modes
   - Input `startLine` (number), `mode` (`"insert"` | `"replace"` | `"replaceAll"`), `lines` (string)

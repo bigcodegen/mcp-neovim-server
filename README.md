@@ -4,6 +4,13 @@ Connect Claude Desktop (or any Model Context Protocol client) to Neovim using MC
 
 <a href="https://glama.ai/mcp/servers/s0fywdwp87"><img width="380" height="200" src="https://glama.ai/mcp/servers/s0fywdwp87/badge" alt="mcp-neovim-server MCP server" /></a>
 
+## What's New in v0.6.0
+
+- **Improved error handling**: Errors now propagate correctly through the MCP protocol, allowing clients to properly distinguish between success and failure responses
+- **Graceful shutdown**: Added signal handlers (SIGTERM, SIGINT) that cleanly disconnect and free resources
+- **Bug fixes**: Fixed register name generation and removed non-functional operation queue code
+- **Better code quality**: Simplified architecture and improved resource management
+
 ## Features
 
 - Connects to your nvim instance if you expose a socket file, for example `--listen /tmp/nvim`, when starting nvim
@@ -107,13 +114,15 @@ Using this comprehensive set of **19 tools**, Claude can peer into your neovim s
 
 ## Error Handling
 
-The server implements comprehensive error handling with custom error classes and consistent error responses:
+The server implements comprehensive error handling with custom error classes:
 
 - **NeovimConnectionError**: Socket connection failures with detailed messages
-- **NeovimCommandError**: Command execution failures with command context  
+- **NeovimCommandError**: Command execution failures with command context
 - **NeovimValidationError**: Input validation failures
+- **BufferNotFoundError**: Buffer lookup failures
+- **WindowNotFoundError**: Window operation failures
 
-**New in v0.5.2**: All tools now include robust try-catch error handling that returns meaningful error messages in proper MCP format. Features include connection health monitoring, graceful error propagation, and actionable error messages to help diagnose issues.
+All errors are properly thrown and handled by the MCP SDK, ensuring clients receive structured error responses with full context. The server includes graceful shutdown handlers (SIGTERM, SIGINT) that clean up connections and resources on exit.
 
 ## Limitations
 

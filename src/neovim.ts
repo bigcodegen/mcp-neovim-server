@@ -1,24 +1,43 @@
 import { attach, Neovim } from 'neovim';
 
-export class NeovimConnectionError extends Error {
-  constructor(socketPath: string, cause?: Error) {
-    super(`Failed to connect to Neovim at ${socketPath}. Is Neovim running with --listen ${socketPath}?`);
-    this.name = 'NeovimConnectionError';
-    this.cause = cause;
-  }
-}
-
-export class NeovimCommandError extends Error {
-  constructor(command: string, originalError: string) {
-    super(`Failed to execute command '${command}': ${originalError}`);
-    this.name = 'NeovimCommandError';
-  }
-}
-
-export class NeovimValidationError extends Error {
-  constructor(message: string) {
+export class NeovimAPIError extends Error {
+  constructor(
+    public readonly code: string,
+    message: string,
+    public readonly context?: any
+  ) {
     super(message);
-    this.name = 'NeovimValidationError';
+    this.name = 'NeovimAPIError';
+  }
+}
+
+export class NeovimConnectionError extends NeovimAPIError {
+  constructor(socketPath: string, cause?: Error) {
+    super('CONNECTION_ERROR', `Failed to connect to Neovim at ${socketPath}. Is Neovim running with --listen ${socketPath}?`, { socketPath, cause });
+  }
+}
+
+export class NeovimCommandError extends NeovimAPIError {
+  constructor(command: string, originalError: string) {
+    super('COMMAND_ERROR', `Failed to execute command '${command}': ${originalError}`, { command, originalError });
+  }
+}
+
+export class NeovimValidationError extends NeovimAPIError {
+  constructor(message: string, field?: string) {
+    super('VALIDATION_ERROR', message, { field });
+  }
+}
+
+export class BufferNotFoundError extends NeovimAPIError {
+  constructor(bufferId: number | string) {
+    super('BUFFER_NOT_FOUND', `Buffer ${bufferId} not found`, { bufferId });
+  }
+}
+
+export class WindowNotFoundError extends NeovimAPIError {
+  constructor(windowId: number) {
+    super('WINDOW_NOT_FOUND', `Window ${windowId} not found`, { windowId });
   }
 }
 
@@ -63,8 +82,49 @@ interface WindowInfo {
   col: number;
 }
 
+interface BufferChangeEvent {
+  bufferId: number;
+  tick: number;
+  changes: Array<{
+    line: number;
+    added: number;
+    removed: number;
+    text: string[];
+  }>;
+}
+
+interface CursorMoveEvent {
+  bufferId: number;
+  line: number;
+  column: number;
+}
+
+interface LSPClientInfo {
+  id: number;
+  name: string;
+  capabilities: any;
+  attachedBuffers: number[];
+}
+
+interface EventSubscription {
+  id: string;
+  event: string;
+  callback: (data: any) => void;
+}
+
 export class NeovimManager {
   private static instance: NeovimManager;
+  private nvim?: Neovim;
+  private connectionState: 'disconnected' | 'connecting' | 'connected' = 'disconnected';
+  private connectionPromise?: Promise<Neovim>;
+  private eventSubscriptions: Map<string, EventSubscription> = new Map();
+  private eventListenersAttached = false;
+  
+  // Performance optimization: caching
+  private bufferCache: Map<number, { lines: string[]; timestamp: number }> = new Map();
+  private windowCache: Map<number, WindowInfo> = new Map();
+  private cacheTimeout = 5000; // 5 seconds
+  private lastBufferId?: number;
 
   private constructor() { }
 
@@ -75,13 +135,282 @@ export class NeovimManager {
     return NeovimManager.instance;
   }
 
+  private async ensureConnected(): Promise<Neovim> {
+    if (this.connectionState === 'connected' && this.nvim) {
+      return this.nvim;
+    }
+    
+    if (this.connectionState === 'connecting' && this.connectionPromise) {
+      return this.connectionPromise;
+    }
+    
+    return this.reconnect();
+  }
+
+  private async reconnect(): Promise<Neovim> {
+    this.connectionState = 'connecting';
+    this.connectionPromise = this.connect();
+    
+    try {
+      this.nvim = await this.connectionPromise;
+      this.connectionState = 'connected';
+      await this.attachEventListeners();
+      return this.nvim;
+    } catch (error) {
+      this.connectionState = 'disconnected';
+      this.connectionPromise = undefined;
+      throw error;
+    }
+  }
+
+  private async attachEventListeners(): Promise<void> {
+    if (!this.nvim || this.eventListenersAttached) {
+      return;
+    }
+
+    try {
+      // Buffer change events
+      this.nvim.on('buflines', (event: any) => {
+        this.emitEvent('buffer_change', {
+          bufferId: event.buffer,
+          tick: event.tick,
+          changes: event.changes
+        });
+      });
+
+      // Cursor movement events
+      this.nvim.on('cursor_moved', (event: any) => {
+        this.emitEvent('cursor_move', {
+          bufferId: event.buffer,
+          line: event.line,
+          column: event.column
+        });
+      });
+
+      // Mode change events
+      this.nvim.on('mode_changed', (event: any) => {
+        this.emitEvent('mode_change', {
+          mode: event.mode,
+          oldMode: event.oldMode
+        });
+      });
+
+      // Buffer enter/leave events
+      this.nvim.on('bufenter', (event: any) => {
+        this.emitEvent('buffer_enter', {
+          bufferId: event.buffer
+        });
+      });
+
+      this.nvim.on('bufleave', (event: any) => {
+        this.emitEvent('buffer_leave', {
+          bufferId: event.buffer
+        });
+      });
+
+      this.eventListenersAttached = true;
+    } catch (error) {
+      console.error('Failed to attach event listeners:', error);
+    }
+  }
+
+  private emitEvent(eventType: string, data: any): void {
+    for (const [id, subscription] of this.eventSubscriptions) {
+      if (subscription.event === eventType) {
+        try {
+          subscription.callback(data);
+        } catch (error) {
+          console.error(`Error in event subscription ${id}:`, error);
+        }
+      }
+    }
+  }
+
+  public subscribeToEvent(eventType: string, callback: (data: any) => void): string {
+    const id = Math.random().toString(36).substr(2, 9);
+    this.eventSubscriptions.set(id, {
+      id,
+      event: eventType,
+      callback
+    });
+    return id;
+  }
+
+  public unsubscribeFromEvent(subscriptionId: string): boolean {
+    return this.eventSubscriptions.delete(subscriptionId);
+  }
+
+  public getActiveSubscriptions(): Array<{ id: string; event: string }> {
+    return Array.from(this.eventSubscriptions.values()).map(sub => ({
+      id: sub.id,
+      event: sub.event
+    }));
+  }
+
+  // Performance optimization methods
+  private isCacheValid(timestamp: number): boolean {
+    return Date.now() - timestamp < this.cacheTimeout;
+  }
+
+  private clearCache(): void {
+    this.bufferCache.clear();
+    this.windowCache.clear();
+  }
+
+  // Optimized buffer operations with caching
+  public async getBufferContentsOptimized(filename?: string): Promise<Map<number, string>> {
+    try {
+      const nvim = await this.ensureConnected();
+      let buffer;
+
+      if (filename) {
+        const buffers = await nvim.buffers;
+        let targetBuffer = null;
+
+        for (const buf of buffers) {
+          const bufName = await buf.name;
+          if (bufName === filename || bufName.endsWith(filename)) {
+            targetBuffer = buf;
+            break;
+          }
+        }
+
+        if (!targetBuffer) {
+          throw new BufferNotFoundError(filename);
+        }
+        buffer = targetBuffer;
+      } else {
+        buffer = await nvim.buffer;
+      }
+
+      // Check cache first
+      const cached = this.bufferCache.get(buffer.id);
+      if (cached && this.isCacheValid(cached.timestamp)) {
+        const lineMap = new Map<number, string>();
+        cached.lines.forEach((line: string, index: number) => {
+          lineMap.set(index + 1, line);
+        });
+        return lineMap;
+      }
+
+      // Get fresh data and cache it
+      const lines = await buffer.getLines({ start: 0, end: -1, strictIndexing: false });
+      this.bufferCache.set(buffer.id, {
+        lines,
+        timestamp: Date.now()
+      });
+
+      const lineMap = new Map<number, string>();
+      lines.forEach((line: string, index: number) => {
+        lineMap.set(index + 1, line);
+      });
+
+      this.lastBufferId = buffer.id;
+      return lineMap;
+    } catch (error) {
+      if (error instanceof NeovimAPIError) {
+        throw error;
+      }
+      console.error('Error getting buffer contents:', error);
+      throw new NeovimAPIError('BUFFER_CONTENTS_ERROR', 'Failed to get buffer contents', { filename, error });
+    }
+  }
+
+  // Batch operations for better performance
+  public async batchBufferOperations(operations: Array<{
+    type: 'edit' | 'insert' | 'delete';
+    startLine: number;
+    endLine?: number;
+    text?: string;
+  }>): Promise<string> {
+    if (operations.length === 0) {
+      return 'No operations to perform';
+    }
+
+    try {
+      const nvim = await this.ensureConnected();
+      const buffer = await nvim.buffer;
+
+      // Clear cache since we're modifying the buffer
+      if (this.lastBufferId) {
+        this.bufferCache.delete(this.lastBufferId);
+      }
+
+      // Sort operations by line number to avoid conflicts
+      operations.sort((a, b) => a.startLine - b.startLine);
+
+      for (const op of operations) {
+        switch (op.type) {
+          case 'edit':
+            if (op.text !== undefined) {
+              const lines = op.text.split('\n');
+              await buffer.setLines(lines, {
+                start: op.startLine - 1,
+                end: op.endLine ? op.endLine : op.startLine
+              });
+            }
+            break;
+
+          case 'insert':
+            if (op.text !== undefined) {
+              const lines = op.text.split('\n');
+              await buffer.setLines(lines, {
+                start: op.startLine - 1,
+                end: op.startLine - 1
+              });
+            }
+            break;
+
+          case 'delete':
+            await buffer.setLines([], {
+              start: op.startLine - 1,
+              end: op.endLine ? op.endLine : op.startLine
+            });
+            break;
+        }
+      }
+
+      return `Completed ${operations.length} buffer operations`;
+    } catch (error) {
+      if (error instanceof NeovimAPIError) {
+        throw error;
+      }
+      console.error('Error in batch buffer operations:', error);
+      throw new NeovimAPIError('BATCH_OPERATION_ERROR', 'Failed to perform batch operations', { operations, error });
+    }
+  }
+
   public async healthCheck(): Promise<boolean> {
     try {
-      const nvim = await this.connect();
+      const nvim = await this.ensureConnected();
       await nvim.eval('1'); // Simple test
       return true;
     } catch {
+      this.connectionState = 'disconnected';
+      this.nvim = undefined;
       return false;
+    }
+  }
+
+  public async disconnect(): Promise<void> {
+    try {
+      // Clear all event subscriptions
+      this.eventSubscriptions.clear();
+      this.eventListenersAttached = false;
+
+      // Clear caches
+      this.clearCache();
+
+      // Clear the connection (we don't quit Neovim as it's an external instance)
+      if (this.nvim) {
+        this.nvim = undefined;
+      }
+
+      this.connectionState = 'disconnected';
+      this.connectionPromise = undefined;
+    } catch (error) {
+      console.error('Error during disconnect:', error);
+      throw new NeovimAPIError('DISCONNECT_ERROR', 'Failed to disconnect from Neovim', { error });
     }
   }
 
@@ -107,7 +436,7 @@ export class NeovimManager {
 
   public async getBufferContents(filename?: string): Promise<Map<number, string>> {
     try {
-      const nvim = await this.connect();
+      const nvim = await this.ensureConnected();
       let buffer;
       
       if (filename) {
@@ -124,14 +453,15 @@ export class NeovimManager {
         }
         
         if (!targetBuffer) {
-          throw new NeovimValidationError(`Buffer not found: ${filename}`);
+          throw new BufferNotFoundError(filename);
         }
         buffer = targetBuffer;
       } else {
         buffer = await nvim.buffer;
       }
       
-      const lines = await buffer.lines;
+      // Use direct API instead of buffer.lines
+      const lines = await buffer.getLines({ start: 0, end: -1, strictIndexing: false });
       const lineMap = new Map<number, string>();
 
       lines.forEach((line: string, index: number) => {
@@ -140,21 +470,21 @@ export class NeovimManager {
 
       return lineMap;
     } catch (error) {
-      if (error instanceof NeovimValidationError) {
+      if (error instanceof NeovimAPIError) {
         throw error;
       }
       console.error('Error getting buffer contents:', error);
-      return new Map();
+      throw new NeovimAPIError('BUFFER_CONTENTS_ERROR', 'Failed to get buffer contents', { filename, error });
     }
   }
 
   public async sendCommand(command: string): Promise<string> {
     if (!command || command.trim().length === 0) {
-      throw new NeovimValidationError('Command cannot be empty');
+      throw new NeovimValidationError('Command cannot be empty', 'command');
     }
 
     try {
-      const nvim = await this.connect();
+      const nvim = await this.ensureConnected();
 
       // Remove leading colon if present
       const normalizedCommand = command.startsWith(':') ? command.substring(1) : command;
@@ -167,7 +497,7 @@ export class NeovimManager {
 
         const shellCommand = normalizedCommand.substring(1).trim();
         if (!shellCommand) {
-          throw new NeovimValidationError('Shell command cannot be empty');
+          throw new NeovimValidationError('Shell command cannot be empty', 'shellCommand');
         }
         
         try {
@@ -200,7 +530,7 @@ export class NeovimManager {
       // Return the actual command output if any
       return output ? String(output).trim() : 'Command executed (no output)';
     } catch (error) {
-      if (error instanceof NeovimCommandError || error instanceof NeovimValidationError) {
+      if (error instanceof NeovimAPIError) {
         throw error;
       }
       console.error('Error sending command:', error);
@@ -327,7 +657,7 @@ export class NeovimManager {
 
   public async getNeovimStatus(): Promise<NeovimStatus | string> {
     try {
-      const nvim = await this.connect();
+      const nvim = await this.ensureConnected();
       const window = await nvim.window;
       const cursor = await window.cursor;
       const mode = await nvim.mode;
@@ -338,26 +668,26 @@ export class NeovimManager {
       const tabpage = await nvim.tabpage;
       const currentTab = await tabpage.number;
 
-      // Get marks (a-z) - only include set marks
+      // Get marks (a-z) - only include set marks using direct buffer API
       const marks: { [key: string]: [number, number] } = {};
       for (const mark of 'abcdefghijklmnopqrstuvwxyz') {
         try {
-          const pos = await nvim.eval(`getpos("'${mark}")`) as [number, number, number, number];
+          const pos = await buffer.mark(mark);
           // Only include marks that are actually set (not at position 0,0)
-          if (pos[1] > 0 && pos[2] > 0) {
-            marks[mark] = [pos[1], pos[2]];
+          if (pos[0] > 0 && pos[1] > 0) {
+            marks[mark] = pos;
           }
         } catch (e) {
           // Mark not set
         }
       }
 
-      // Get registers (a-z, ", 0-9) - only include non-empty registers
+      // Get registers (a-z, ", 0-9) - only include non-empty registers using callFunction
       const registers: { [key: string]: string } = {};
-      const registerNames = [...'abcdefghijklmnopqrstuvwxyz', '"', ...Array(10).keys()];
+      const registerNames = [...'abcdefghijklmnopqrstuvwxyz', '"', ...Array.from(Array(10).keys()).map(String)];
       for (const reg of registerNames) {
         try {
-          const content = String(await nvim.eval(`getreg('${reg}')`));
+          const content = String(await nvim.callFunction('getreg', [String(reg)]));
           // Only include registers that have content
           if (content && content.trim().length > 0) {
             registers[String(reg)] = content;
@@ -432,14 +762,24 @@ export class NeovimManager {
 
       return neovimStatus;
     } catch (error) {
+      if (error instanceof NeovimAPIError) {
+        throw error;
+      }
       console.error('Error getting Neovim status:', error);
-      return 'Error getting Neovim status';
+      throw new NeovimAPIError('STATUS_ERROR', 'Failed to get Neovim status', { error });
     }
   }
 
   public async editLines(startLine: number, mode: 'replace' | 'insert' | 'replaceAll', newText: string): Promise<string> {
+    if (startLine < 1) {
+      throw new NeovimValidationError('Start line must be >= 1', 'startLine');
+    }
+    if (!['replace', 'insert', 'replaceAll'].includes(mode)) {
+      throw new NeovimValidationError('Invalid mode. Must be replace, insert, or replaceAll', 'mode');
+    }
+
     try {
-      const nvim = await this.connect();
+      const nvim = await this.ensureConnected();
       const splitByLines = newText.split('\n');
       const buffer = await nvim.buffer;
 
@@ -460,14 +800,17 @@ export class NeovimManager {
 
       return 'Invalid mode specified';
     } catch (error) {
+      if (error instanceof NeovimAPIError) {
+        throw error;
+      }
       console.error('Error editing lines:', error);
-      return 'Error editing lines';
+      throw new NeovimAPIError('EDIT_LINES_ERROR', 'Failed to edit lines', { startLine, mode, error });
     }
   }
 
   public async getWindows(): Promise<WindowInfo[]> {
     try {
-      const nvim = await this.connect();
+      const nvim = await this.ensureConnected();
       const windows = await nvim.windows;
       const windowInfos: WindowInfo[] = [];
 
@@ -491,87 +834,148 @@ export class NeovimManager {
 
       return windowInfos;
     } catch (error) {
+      if (error instanceof NeovimAPIError) {
+        throw error;
+      }
       console.error('Error getting windows:', error);
-      return [];
+      throw new NeovimAPIError('WINDOWS_ERROR', 'Failed to get windows', { error });
     }
   }
 
   public async manipulateWindow(command: string): Promise<string> {
     const validCommands = ['split', 'vsplit', 'only', 'close', 'wincmd h', 'wincmd j', 'wincmd k', 'wincmd l'];
     if (!validCommands.some(cmd => command.startsWith(cmd))) {
-      return 'Invalid window command';
+      throw new NeovimValidationError(`Invalid window command: ${command}`, 'command');
     }
 
     try {
-      const nvim = await this.connect();
-      await nvim.command(command);
-      return 'Window command executed';
+      const nvim = await this.ensureConnected();
+      
+      // Use direct APIs for navigation commands
+      if (command === 'wincmd h' || command === 'wincmd k') {
+        // Move to previous window (left or up)
+        const currentWindow = await nvim.window;
+        const windows = await nvim.windows;
+        const currentIndex = windows.findIndex(w => w.id === currentWindow.id);
+        if (currentIndex > 0) {
+          await nvim.setWindow(windows[currentIndex - 1]);
+        }
+        return `Moved to window ${command === 'wincmd h' ? 'left' : 'above'}`;
+      } else if (command === 'wincmd j' || command === 'wincmd l') {
+        // Move to next window (right or down)
+        const currentWindow = await nvim.window;
+        const windows = await nvim.windows;
+        const currentIndex = windows.findIndex(w => w.id === currentWindow.id);
+        if (currentIndex < windows.length - 1) {
+          await nvim.setWindow(windows[currentIndex + 1]);
+        }
+        return `Moved to window ${command === 'wincmd j' ? 'below' : 'right'}`;
+      } else if (command === 'close') {
+        const currentWindow = await nvim.window;
+        await currentWindow.close(true);
+        return 'Window closed';
+      } else {
+        // For split, vsplit, only commands, still use nvim.command as they require complex operations
+        await nvim.command(command);
+        return 'Window command executed';
+      }
     } catch (error) {
+      if (error instanceof NeovimAPIError) {
+        throw error;
+      }
       console.error('Error manipulating window:', error);
-      return 'Error executing window command';
+      throw new NeovimAPIError('WINDOW_MANIPULATION_ERROR', 'Failed to manipulate window', { command, error });
     }
   }
 
   public async setMark(mark: string, line: number, col: number): Promise<string> {
     if (!/^[a-z]$/.test(mark)) {
-      return 'Invalid mark name (must be a-z)';
+      throw new NeovimValidationError('Invalid mark name (must be a-z)', 'mark');
+    }
+    if (line < 1) {
+      throw new NeovimValidationError('Line must be >= 1', 'line');
+    }
+    if (col < 0) {
+      throw new NeovimValidationError('Column must be >= 0', 'col');
     }
 
     try {
-      const nvim = await this.connect();
-      await nvim.command(`mark ${mark}`);
+      const nvim = await this.ensureConnected();
+      // Move cursor to position and set mark
       const window = await nvim.window;
-      await (window.cursor = [line, col]);
+      window.cursor = [line, col];
+      await nvim.command(`mark ${mark}`);
       return `Mark ${mark} set at line ${line}, column ${col}`;
     } catch (error) {
+      if (error instanceof NeovimAPIError) {
+        throw error;
+      }
       console.error('Error setting mark:', error);
-      return 'Error setting mark';
+      throw new NeovimAPIError('SET_MARK_ERROR', 'Failed to set mark', { mark, line, col, error });
     }
   }
 
   public async setRegister(register: string, content: string): Promise<string> {
     const validRegisters = [...'abcdefghijklmnopqrstuvwxyz"'];
     if (!validRegisters.includes(register)) {
-      return 'Invalid register name';
+      throw new NeovimValidationError('Invalid register name', 'register');
     }
 
     try {
-      const nvim = await this.connect();
-      await nvim.eval(`setreg('${register}', '${content.replace(/'/g, "''")}')`);
+      const nvim = await this.ensureConnected();
+      // Use callFunction instead of eval for better performance
+      await nvim.callFunction('setreg', [register, content]);
       return `Register ${register} set`;
     } catch (error) {
+      if (error instanceof NeovimAPIError) {
+        throw error;
+      }
       console.error('Error setting register:', error);
-      return 'Error setting register';
+      throw new NeovimAPIError('SET_REGISTER_ERROR', 'Failed to set register', { register, error });
     }
   }
 
   public async visualSelect(startLine: number, startCol: number, endLine: number, endCol: number): Promise<string> {
+    if (startLine < 1 || endLine < 1) {
+      throw new NeovimValidationError('Line numbers must be >= 1', 'startLine/endLine');
+    }
+    if (startCol < 0 || endCol < 0) {
+      throw new NeovimValidationError('Column numbers must be >= 0', 'startCol/endCol');
+    }
+
     try {
-      const nvim = await this.connect();
+      const nvim = await this.ensureConnected();
       const window = await nvim.window;
       
-      // Enter visual mode
-      await nvim.command('normal! v');
+      // Move cursor to start position first
+      window.cursor = [startLine, startCol];
       
-      // Move cursor to start position
-      await (window.cursor = [startLine, startCol]);
-      
-      // Move cursor to end position (selection will be made)
-      await (window.cursor = [endLine, endCol]);
+      // Enter visual mode and select to end position
+      await nvim.input('v');
+      window.cursor = [endLine, endCol];
       
       return 'Visual selection made';
     } catch (error) {
+      if (error instanceof NeovimAPIError) {
+        throw error;
+      }
       console.error('Error making visual selection:', error);
-      return 'Error making visual selection';
+      throw new NeovimAPIError('VISUAL_SELECT_ERROR', 'Failed to make visual selection', { startLine, startCol, endLine, endCol, error });
     }
   }
 
   public async switchBuffer(identifier: string | number): Promise<string> {
+    if (!identifier) {
+      throw new NeovimValidationError('Buffer identifier cannot be empty', 'identifier');
+    }
+
     try {
-      const nvim = await this.connect();
+      const nvim = await this.ensureConnected();
       
-      // If identifier is a number, switch by buffer number
+      // If identifier is a number, switch by buffer number using callFunction
       if (typeof identifier === 'number') {
+        await nvim.callFunction('bufload', [identifier]);
+        await nvim.callFunction('setbufvar', [identifier, '&buflisted', 1]);
         await nvim.command(`buffer ${identifier}`);
         return `Switched to buffer ${identifier}`;
       }
@@ -588,17 +992,17 @@ export class NeovimManager {
       
       throw new NeovimValidationError(`Buffer not found: ${identifier}`);
     } catch (error) {
-      if (error instanceof NeovimValidationError) {
+      if (error instanceof NeovimAPIError) {
         throw error;
       }
       console.error('Error switching buffer:', error);
-      throw new NeovimCommandError(`buffer switch to ${identifier}`, error instanceof Error ? error.message : 'Unknown error');
+      throw new NeovimAPIError('SWITCH_BUFFER_ERROR', 'Failed to switch buffer', { identifier, error });
     }
   }
 
   public async saveBuffer(filename?: string): Promise<string> {
     try {
-      const nvim = await this.connect();
+      const nvim = await this.ensureConnected();
       
       if (filename) {
         // Save with specific filename
@@ -617,36 +1021,39 @@ export class NeovimManager {
         return `Buffer saved: ${bufferName}`;
       }
     } catch (error) {
-      if (error instanceof NeovimValidationError) {
+      if (error instanceof NeovimAPIError) {
         throw error;
       }
       console.error('Error saving buffer:', error);
-      throw new NeovimCommandError(`save ${filename || 'current buffer'}`, error instanceof Error ? error.message : 'Unknown error');
+      throw new NeovimAPIError('SAVE_BUFFER_ERROR', 'Failed to save buffer', { filename, error });
     }
   }
 
   public async openFile(filename: string): Promise<string> {
     if (!filename || filename.trim().length === 0) {
-      throw new NeovimValidationError('Filename cannot be empty');
+      throw new NeovimValidationError('Filename cannot be empty', 'filename');
     }
     
     try {
-      const nvim = await this.connect();
+      const nvim = await this.ensureConnected();
       await nvim.command(`edit ${filename}`);
       return `Opened file: ${filename}`;
     } catch (error) {
+      if (error instanceof NeovimAPIError) {
+        throw error;
+      }
       console.error('Error opening file:', error);
-      throw new NeovimCommandError(`edit ${filename}`, error instanceof Error ? error.message : 'Unknown error');
+      throw new NeovimAPIError('OPEN_FILE_ERROR', 'Failed to open file', { filename, error });
     }
   }
 
   public async searchInBuffer(pattern: string, options: { ignoreCase?: boolean; wholeWord?: boolean } = {}): Promise<string> {
     if (!pattern || pattern.trim().length === 0) {
-      throw new NeovimValidationError('Search pattern cannot be empty');
+      throw new NeovimValidationError('Search pattern cannot be empty', 'pattern');
     }
     
     try {
-      const nvim = await this.connect();
+      const nvim = await this.ensureConnected();
       
       // Build search command with options
       let searchPattern = pattern;
@@ -674,18 +1081,21 @@ export class NeovimManager {
       
       return `Found ${matchInfo.total} matches for: ${pattern}${matchInfo.incomplete ? ' (showing first 100)' : ''}`;
     } catch (error) {
+      if (error instanceof NeovimAPIError) {
+        throw error;
+      }
       console.error('Error searching in buffer:', error);
-      throw new NeovimCommandError(`search for ${pattern}`, error instanceof Error ? error.message : 'Unknown error');
+      throw new NeovimAPIError('SEARCH_BUFFER_ERROR', 'Failed to search in buffer', { pattern, options, error });
     }
   }
 
   public async searchAndReplace(pattern: string, replacement: string, options: { global?: boolean; ignoreCase?: boolean; confirm?: boolean } = {}): Promise<string> {
     if (!pattern || pattern.trim().length === 0) {
-      throw new NeovimValidationError('Search pattern cannot be empty');
+      throw new NeovimValidationError('Search pattern cannot be empty', 'pattern');
     }
     
     try {
-      const nvim = await this.connect();
+      const nvim = await this.ensureConnected();
       
       // Build substitute command
       let flags = '';
@@ -698,18 +1108,21 @@ export class NeovimManager {
       const result = await nvim.call('execute', [command]);
       return result ? String(result).trim() : 'Search and replace completed';
     } catch (error) {
+      if (error instanceof NeovimAPIError) {
+        throw error;
+      }
       console.error('Error in search and replace:', error);
-      throw new NeovimCommandError(`substitute ${pattern} -> ${replacement}`, error instanceof Error ? error.message : 'Unknown error');
+      throw new NeovimAPIError('SEARCH_REPLACE_ERROR', 'Failed to search and replace', { pattern, replacement, options, error });
     }
   }
 
   public async grepInProject(pattern: string, filePattern: string = '**/*'): Promise<string> {
     if (!pattern || pattern.trim().length === 0) {
-      throw new NeovimValidationError('Grep pattern cannot be empty');
+      throw new NeovimValidationError('Grep pattern cannot be empty', 'pattern');
     }
     
     try {
-      const nvim = await this.connect();
+      const nvim = await this.ensureConnected();
       
       // Use vimgrep for internal searching
       const command = `vimgrep /${pattern}/ ${filePattern}`;
@@ -730,14 +1143,17 @@ export class NeovimManager {
       const totalText = results.length > 10 ? `\n... and ${results.length - 10} more matches` : '';
       return `Found ${results.length} matches for: ${pattern}\n${summary}${totalText}`;
     } catch (error) {
+      if (error instanceof NeovimAPIError) {
+        throw error;
+      }
       console.error('Error in grep:', error);
-      throw new NeovimCommandError(`grep ${pattern}`, error instanceof Error ? error.message : 'Unknown error');
+      throw new NeovimAPIError('GREP_ERROR', 'Failed to grep in project', { pattern, filePattern, error });
     }
   }
 
   public async getOpenBuffers(): Promise<BufferInfo[]> {
     try {
-      const nvim = await this.connect();
+      const nvim = await this.ensureConnected();
       const buffers = await nvim.buffers;
       const windows = await nvim.windows;
       const bufferInfos: BufferInfo[] = [];
@@ -750,9 +1166,9 @@ export class NeovimManager {
           syntax
         ] = await Promise.all([
           buffer.loaded,
-          buffer.getOption('buflisted'),
-          buffer.getOption('modified'),
-          buffer.getOption('syntax')
+          nvim.callFunction('getbufvar', [buffer.id, '&buflisted']),
+          nvim.callFunction('getbufvar', [buffer.id, '&modified']),
+          nvim.callFunction('getbufvar', [buffer.id, '&syntax'])
         ]);
         const isListed = Boolean(isListedOption);
 
@@ -778,14 +1194,24 @@ export class NeovimManager {
 
       return bufferInfos;
     } catch (error) {
+      if (error instanceof NeovimAPIError) {
+        throw error;
+      }
       console.error('Error getting open buffers:', error);
-      return [];
+      throw new NeovimAPIError('GET_BUFFERS_ERROR', 'Failed to get open buffers', { error });
     }
   }
 
   public async manageMacro(action: string, register?: string, count: number = 1): Promise<string> {
+    if (!['record', 'stop', 'play'].includes(action)) {
+      throw new NeovimValidationError('Invalid macro action. Must be record, stop, or play', 'action');
+    }
+    if (count < 1) {
+      throw new NeovimValidationError('Count must be >= 1', 'count');
+    }
+
     try {
-      const nvim = await this.connect();
+      const nvim = await this.ensureConnected();
       
       switch (action) {
         case 'record':
@@ -811,17 +1237,21 @@ export class NeovimManager {
           throw new NeovimValidationError(`Unknown macro action: ${action}`);
       }
     } catch (error) {
-      if (error instanceof NeovimValidationError) {
+      if (error instanceof NeovimAPIError) {
         throw error;
       }
       console.error('Error managing macro:', error);
-      throw new NeovimCommandError(`macro ${action}`, error instanceof Error ? error.message : 'Unknown error');
+      throw new NeovimAPIError('MACRO_ERROR', 'Failed to manage macro', { action, register, count, error });
     }
   }
 
   public async manageTab(action: string, filename?: string): Promise<string> {
+    if (!['new', 'close', 'next', 'prev', 'first', 'last', 'list'].includes(action)) {
+      throw new NeovimValidationError('Invalid tab action', 'action');
+    }
+
     try {
-      const nvim = await this.connect();
+      const nvim = await this.ensureConnected();
       
       switch (action) {
         case 'new':
@@ -871,17 +1301,24 @@ export class NeovimManager {
           throw new NeovimValidationError(`Unknown tab action: ${action}`);
       }
     } catch (error) {
-      if (error instanceof NeovimValidationError) {
+      if (error instanceof NeovimAPIError) {
         throw error;
       }
       console.error('Error managing tab:', error);
-      throw new NeovimCommandError(`tab ${action}`, error instanceof Error ? error.message : 'Unknown error');
+      throw new NeovimAPIError('TAB_ERROR', 'Failed to manage tab', { action, filename, error });
     }
   }
 
   public async manageFold(action: string, startLine?: number, endLine?: number): Promise<string> {
+    if (!['create', 'open', 'close', 'toggle', 'openall', 'closeall', 'delete'].includes(action)) {
+      throw new NeovimValidationError('Invalid fold action', 'action');
+    }
+    if (action === 'create' && (startLine === undefined || endLine === undefined)) {
+      throw new NeovimValidationError('Start line and end line are required for creating folds', 'startLine/endLine');
+    }
+
     try {
-      const nvim = await this.connect();
+      const nvim = await this.ensureConnected();
       
       switch (action) {
         case 'create':
@@ -919,17 +1356,21 @@ export class NeovimManager {
           throw new NeovimValidationError(`Unknown fold action: ${action}`);
       }
     } catch (error) {
-      if (error instanceof NeovimValidationError) {
+      if (error instanceof NeovimAPIError) {
         throw error;
       }
       console.error('Error managing fold:', error);
-      throw new NeovimCommandError(`fold ${action}`, error instanceof Error ? error.message : 'Unknown error');
+      throw new NeovimAPIError('FOLD_ERROR', 'Failed to manage fold', { action, startLine, endLine, error });
     }
   }
 
   public async navigateJumpList(direction: string): Promise<string> {
+    if (!['back', 'forward', 'list'].includes(direction)) {
+      throw new NeovimValidationError('Invalid jump direction', 'direction');
+    }
+
     try {
-      const nvim = await this.connect();
+      const nvim = await this.ensureConnected();
       
       switch (direction) {
         case 'back':
@@ -950,11 +1391,202 @@ export class NeovimManager {
           throw new NeovimValidationError(`Unknown jump direction: ${direction}`);
       }
     } catch (error) {
-      if (error instanceof NeovimValidationError) {
+      if (error instanceof NeovimAPIError) {
         throw error;
       }
       console.error('Error navigating jump list:', error);
-      throw new NeovimCommandError(`jump ${direction}`, error instanceof Error ? error.message : 'Unknown error');
+      throw new NeovimAPIError('JUMP_ERROR', 'Failed to navigate jump list', { direction, error });
+    }
+  }
+
+  // LSP Integration Methods
+  public async getLSPClients(): Promise<LSPClientInfo[]> {
+    try {
+      const nvim = await this.ensureConnected();
+      
+      try {
+        const lspClients = await nvim.eval('luaeval("vim.lsp.get_clients()")');
+        if (!Array.isArray(lspClients)) {
+          return [];
+        }
+
+        return lspClients.map((client: any) => ({
+          id: client.id || 0,
+          name: client.name || 'unknown',
+          capabilities: client.capabilities || {},
+          attachedBuffers: client.attached_buffers || []
+        }));
+      } catch (e) {
+        // Fallback for older Neovim versions
+        const hasLsp = await nvim.eval('exists("*lsp#get_active_clients")');
+        if (hasLsp) {
+          try {
+            const clients = await nvim.eval('lsp#get_active_clients()');
+            return Array.isArray(clients) ? clients.map((client: any) => ({
+              id: client.id || 0,
+              name: client.name || 'unknown',
+              capabilities: client.capabilities || {},
+              attachedBuffers: []
+            })) : [];
+          } catch (e2) {
+            return [];
+          }
+        }
+        return [];
+      }
+    } catch (error) {
+      if (error instanceof NeovimAPIError) {
+        throw error;
+      }
+      console.error('Error getting LSP clients:', error);
+      throw new NeovimAPIError('LSP_CLIENTS_ERROR', 'Failed to get LSP clients', { error });
+    }
+  }
+
+  public async getLSPDiagnostics(bufferId?: number): Promise<any[]> {
+    try {
+      const nvim = await this.ensureConnected();
+      
+      try {
+        const diagnostics = await nvim.eval('luaeval("vim.diagnostic.get()")');
+        return Array.isArray(diagnostics) ? diagnostics : [];
+      } catch (e) {
+        // Fallback for older Neovim versions
+        const hasDiagnostics = await nvim.eval('exists("*lsp#get_buffer_diagnostics")');
+        if (hasDiagnostics) {
+          try {
+            const diagnostics = await nvim.eval('lsp#get_buffer_diagnostics()');
+            return Array.isArray(diagnostics) ? diagnostics : [];
+          } catch (e2) {
+            return [];
+          }
+        }
+        return [];
+      }
+    } catch (error) {
+      if (error instanceof NeovimAPIError) {
+        throw error;
+      }
+      console.error('Error getting LSP diagnostics:', error);
+      throw new NeovimAPIError('LSP_DIAGNOSTICS_ERROR', 'Failed to get LSP diagnostics', { bufferId, error });
+    }
+  }
+
+  public async executeLSPAction(action: string, params?: any): Promise<any> {
+    if (!action) {
+      throw new NeovimValidationError('LSP action cannot be empty', 'action');
+    }
+
+    try {
+      const nvim = await this.ensureConnected();
+      
+      switch (action) {
+        case 'hover':
+          await nvim.command('lua vim.lsp.buf.hover()');
+          return 'LSP hover information displayed';
+          
+        case 'definition':
+          await nvim.command('lua vim.lsp.buf.definition()');
+          return 'Jumped to definition';
+          
+        case 'references':
+          await nvim.command('lua vim.lsp.buf.references()');
+          return 'Found references';
+          
+        case 'rename':
+          if (!params || !params.newName) {
+            throw new NeovimValidationError('New name is required for rename action', 'params.newName');
+          }
+          await nvim.eval(`lua vim.lsp.buf.rename('${params.newName.replace(/'/g, "''")}')`);
+          return `Renamed to ${params.newName}`;
+          
+        case 'format':
+          await nvim.command('lua vim.lsp.buf.format()');
+          return 'Buffer formatted';
+          
+        case 'code_action':
+          await nvim.command('lua vim.lsp.buf.code_action()');
+          return 'Code actions available';
+          
+        default:
+          throw new NeovimValidationError(`Unknown LSP action: ${action}`, 'action');
+      }
+    } catch (error) {
+      if (error instanceof NeovimAPIError) {
+        throw error;
+      }
+      console.error('Error executing LSP action:', error);
+      throw new NeovimAPIError('LSP_ACTION_ERROR', 'Failed to execute LSP action', { action, params, error });
+    }
+  }
+
+  // Advanced Search with Structured Results
+  public async searchWithMatches(pattern: string, options: { 
+    ignoreCase?: boolean; 
+    wholeWord?: boolean;
+    maxResults?: number;
+  } = {}): Promise<Array<{
+    line: number;
+    column: number;
+    endLine: number;
+    endColumn: number;
+    text: string;
+    groups?: string[];
+  }>> {
+    if (!pattern || pattern.trim().length === 0) {
+      throw new NeovimValidationError('Search pattern cannot be empty', 'pattern');
+    }
+
+    try {
+      const nvim = await this.ensureConnected();
+      const buffer = await nvim.buffer;
+      
+      // Build search pattern
+      let searchPattern = pattern;
+      if (options.wholeWord) {
+        searchPattern = `\\<${pattern}\\>`;
+      }
+      
+      // Get all lines
+      const lines = await buffer.getLines({ start: 0, end: -1, strictIndexing: false });
+      const matches: Array<{
+        line: number;
+        column: number;
+        endLine: number;
+        endColumn: number;
+        text: string;
+        groups?: string[];
+      }> = [];
+      
+      // Create regex for matching
+      const flags = options.ignoreCase ? 'gi' : 'g';
+      const regex = new RegExp(searchPattern, flags);
+      
+      lines.forEach((line, lineIndex) => {
+        let match;
+        while ((match = regex.exec(line)) !== null) {
+          if (options.maxResults && matches.length >= options.maxResults) {
+            break;
+          }
+          
+          matches.push({
+            line: lineIndex + 1,
+            column: match.index,
+            endLine: lineIndex + 1,
+            endColumn: match.index + match[0].length,
+            text: match[0],
+            groups: match.length > 1 ? match.slice(1) : undefined
+          });
+        }
+      });
+      
+      return matches;
+    } catch (error) {
+      if (error instanceof NeovimAPIError) {
+        throw error;
+      }
+      console.error('Error in structured search:', error);
+      throw new NeovimAPIError('STRUCTURED_SEARCH_ERROR', 'Failed to perform structured search', { pattern, options, error });
     }
   }
 }
